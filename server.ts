@@ -182,6 +182,7 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
+- whoami: Get your own peer ID and registration info (useful after session restart to tell other peers your current ID)
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -245,6 +246,15 @@ const TOOLS = [
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "Return this instance's own peer ID and registration info (hostname, pid, cwd, tty). Useful when your session has restarted and other peers need to know your current ID to send messages.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -439,6 +449,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    case "whoami": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const info = {
+        id: myId,
+        hostname: myHostname,
+        pid: process.pid,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty: getTty(),
+      };
+      const lines = [
+        `ID: ${info.id}`,
+        `Host: ${info.hostname}`,
+        `PID: ${info.pid}`,
+        `CWD: ${info.cwd}`,
+      ];
+      if (info.git_root) lines.push(`Repo: ${info.git_root}`);
+      if (info.tty) lines.push(`TTY: ${info.tty}`);
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
     }
 
     default:
