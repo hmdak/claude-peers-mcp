@@ -35,10 +35,14 @@ import {
 // --- Configuration ---
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+// Allow connecting to a remote broker via CLAUDE_PEERS_BROKER_URL (e.g. http://evo-x2:7899)
+const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+
+// Detect if broker is remote (not localhost)
+const IS_REMOTE_BROKER = !BROKER_URL.includes("127.0.0.1") && !BROKER_URL.includes("localhost");
 
 // --- Broker communication ---
 
@@ -66,11 +70,15 @@ async function isBrokerAlive(): Promise<boolean> {
 
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
+    log(`Broker already running at ${BROKER_URL}`);
     return;
   }
 
-  log("Starting broker daemon...");
+  if (IS_REMOTE_BROKER) {
+    throw new Error(`Remote broker at ${BROKER_URL} is not reachable. Ensure the broker is running on the remote host.`);
+  }
+
+  log("Starting local broker daemon...");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", "inherit"],
     // Detach so the broker survives if this MCP server exits
@@ -138,6 +146,21 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let myHostname: string = "localhost";
+
+// Track message IDs that we've already pushed via channel notification
+// so we don't re-push the same message on every poll cycle
+const pushedMessageIds = new Set<number>();
+
+async function getHostname(): Promise<string> {
+  try {
+    const proc = Bun.spawnSync(["hostname", "-s"]);
+    const name = new TextDecoder().decode(proc.stdout).trim();
+    return name || "localhost";
+  } catch {
+    return "localhost";
+  }
+}
 
 // --- MCP Server ---
 
@@ -148,7 +171,7 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-peers network. Other Claude Code instances across all machines (local and remote workers) can see you and send you messages.
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
@@ -263,6 +286,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Host: ${p.hostname ?? "localhost"}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -295,7 +319,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const rawArgs = args as Record<string, string>;
+      const to_id = rawArgs.to_id ?? rawArgs.to;
+      const message = rawArgs.message ?? rawArgs.text;
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -364,15 +390,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // Use poll-messages which marks as delivered (ack on read)
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+
+        // Also mark these as pushed so polling loop skips them
+        for (const m of result.messages) {
+          pushedMessageIds.add(m.id);
+        }
+
         if (result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+
+        // Look up sender info for each message
+        let peers: Peer[] = [];
+        try {
+          peers = await brokerFetch<Peer[]>("/list-peers", {
+            scope: "machine",
+            cwd: myCwd,
+            git_root: myGitRoot,
+          });
+        } catch { /* non-critical */ }
+
+        const lines = result.messages.map((m) => {
+          const sender = peers.find((p) => p.id === m.from_id);
+          const host = sender?.hostname ?? "unknown";
+          const summary = sender?.summary ? ` (${sender.summary})` : "";
+          return `From ${m.from_id}@${host}${summary} (${m.sent_at}):\n${m.text}`;
+        });
         return {
           content: [
             {
@@ -405,12 +452,17 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Use peek-messages (does NOT mark as delivered) so check_messages still works
+    const result = await brokerFetch<PollMessagesResponse>("/peek-messages", { id: myId });
 
     for (const msg of result.messages) {
+      // Skip messages we've already pushed
+      if (pushedMessageIds.has(msg.id)) continue;
+
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
+      let fromHostname = "";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope: "machine",
@@ -421,26 +473,34 @@ async function pollAndPushMessages() {
         if (sender) {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
+          fromHostname = sender.hostname ?? "localhost";
         }
       } catch {
         // Non-critical, proceed without sender info
       }
 
       // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_hostname: fromHostname,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        log(`Pushed message from ${msg.from_id}@${fromHostname}: ${msg.text.slice(0, 80)}`);
+      } catch (e) {
+        log(`Channel push failed for msg ${msg.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      // Track as pushed regardless (don't retry endlessly)
+      pushedMessageIds.add(msg.id);
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
@@ -457,8 +517,10 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  myHostname = process.env.CLAUDE_PEERS_HOSTNAME ?? await getHostname();
   const tty = getTty();
 
+  log(`Hostname: ${myHostname}`);
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
@@ -490,6 +552,7 @@ async function main() {
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
+    hostname: myHostname,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,

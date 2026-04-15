@@ -36,6 +36,7 @@ db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
     pid INTEGER NOT NULL,
+    hostname TEXT NOT NULL DEFAULT 'localhost',
     cwd TEXT NOT NULL,
     git_root TEXT,
     tty TEXT,
@@ -58,18 +59,19 @@ db.run(`
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Stale threshold: peers not seen for 60 seconds are considered dead
+const STALE_THRESHOLD_MS = 60_000;
+
+// Clean up stale peers based on last_seen timestamp (works for both local and remote peers)
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
-  for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-    }
+  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  const stale = db.query("SELECT id FROM peers WHERE last_seen < ?").all(cutoff) as { id: string }[];
+  for (const peer of stale) {
+    db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+    db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+  }
+  if (stale.length > 0) {
+    console.error(`[claude-peers broker] Cleaned ${stale.length} stale peer(s)`);
   }
 }
 
@@ -81,8 +83,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, hostname, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -138,14 +140,15 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const hostname = body.hostname ?? "localhost";
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Remove any existing registration for this PID + hostname combo (re-registration)
+  const existing = db.query("SELECT id FROM peers WHERE pid = ? AND hostname = ?").get(body.pid, hostname) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, hostname, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
 
@@ -184,23 +187,17 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
-  return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
-  });
+  // Filter out stale peers (not seen within threshold)
+  const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+  return peers.filter((p) => p.last_seen >= cutoff);
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+  console.error(`[broker] send-message: from=${body.from_id} to=${body.to_id} text=${(body.text ?? "").slice(0, 40)}`);
   // Verify target exists
   const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
   if (!target) {
+    console.error(`[broker] send-message FAILED: Peer ${body.to_id} not found. All peers: ${JSON.stringify((selectAllPeers.all() as Peer[]).map(p => p.id))}`);
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
@@ -219,6 +216,18 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
+function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // Return undelivered messages WITHOUT marking them as delivered
+  const messages = selectUndelivered.all(body.id) as Message[];
+  return { messages };
+}
+
+function handleAckMessages(body: { ids: number[] }): void {
+  for (const id of body.ids) {
+    markDelivered.run(id);
+  }
+}
+
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
@@ -227,7 +236,7 @@ function handleUnregister(body: { id: string }): void {
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -257,6 +266,13 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/peek-messages":
+          // Like poll-messages but does NOT mark as delivered
+          return Response.json(handlePeekMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          // Mark specific message IDs as delivered
+          handleAckMessages(body as { ids: number[] });
+          return Response.json({ ok: true });
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
@@ -270,4 +286,4 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (db: ${DB_PATH})`);
