@@ -153,7 +153,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  const now = new Date().toISOString();
+  const result = updateLastSeen.run(now, body.id);
+  // If no rows updated, the peer was evicted — re-register as a ghost peer
+  // so it at least appears in list_peers and can receive messages.
+  // Next proper /register call (if server supports ensureRegistered) will replace this.
+  if (result.changes === 0) {
+    console.error(`[claude-peers broker] Heartbeat from unknown peer ${body.id}, creating ghost entry`);
+    insertPeer.run(body.id, 0, "unknown", "", null, null, "", now, now);
+  }
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
