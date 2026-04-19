@@ -152,6 +152,42 @@ let myHostname: string = "localhost";
 // so we don't re-push the same message on every poll cycle
 const pushedMessageIds = new Set<number>();
 
+// Auto-register if not registered or evicted
+async function ensureRegistered(): Promise<boolean> {
+  if (myId) {
+    // Check if still registered
+    try {
+      const peers = await brokerFetch<Peer[]>("/list-peers", {
+        scope: "machine",
+        cwd: myCwd,
+        git_root: myGitRoot,
+      });
+      if (peers.some((p) => p.id === myId)) return true;
+    } catch {
+      // Broker down — can't re-register
+      return false;
+    }
+  }
+  // Not registered or evicted — re-register
+  try {
+    log("Auto-registering with broker...");
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      hostname: myHostname,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: getTty(),
+      summary: "",
+    });
+    myId = reg.id;
+    log(`Auto-registered as peer ${myId}`);
+    return true;
+  } catch (e) {
+    log(`Auto-registration failed: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
 async function getHostname(): Promise<string> {
   try {
     const proc = Bun.spawnSync(["hostname", "-s"]);
@@ -333,10 +369,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const to_id = rawArgs.to_id ?? rawArgs.to;
       const message = rawArgs.message ?? rawArgs.text;
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        const ok = await ensureRegistered();
+        if (!ok || !myId) {
+          return {
+            content: [{ type: "text" as const, text: "Not registered with broker and auto-registration failed" }],
+            isError: true,
+          };
+        }
       }
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
@@ -369,10 +408,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     case "set_summary": {
       const { summary } = args as { summary: string };
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        const ok = await ensureRegistered();
+        if (!ok || !myId) {
+          return {
+            content: [{ type: "text" as const, text: "Not registered with broker and auto-registration failed" }],
+            isError: true,
+          };
+        }
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
@@ -394,10 +436,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "check_messages": {
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        const ok = await ensureRegistered();
+        if (!ok || !myId) {
+          return {
+            content: [{ type: "text" as const, text: "Not registered with broker and auto-registration failed" }],
+            isError: true,
+          };
+        }
       }
       try {
         // Use poll-messages which marks as delivered (ack on read)
@@ -453,10 +498,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     case "whoami": {
       if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
+        const ok = await ensureRegistered();
+        if (!ok || !myId) {
+          return {
+            content: [{ type: "text" as const, text: "Not registered with broker and auto-registration failed" }],
+            isError: true,
+          };
+        }
       }
       const info = {
         id: myId,
@@ -487,7 +535,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // --- Polling loop for inbound messages ---
 
 async function pollAndPushMessages() {
-  if (!myId) return;
+  if (!myId) {
+    await ensureRegistered();
+    if (!myId) return;
+  }
 
   try {
     // Use peek-messages (does NOT mark as delivered) so check_messages still works
@@ -620,14 +671,17 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat (with auto-re-register on stale eviction)
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        await brokerFetch("/heartbeat", { id: myId });
-      } catch {
-        // Non-critical
-      }
+    if (!myId) {
+      await ensureRegistered();
+      return;
+    }
+    try {
+      await brokerFetch("/heartbeat", { id: myId });
+    } catch {
+      // Heartbeat failed — check if evicted and re-register
+      await ensureRegistered();
     }
   }, HEARTBEAT_INTERVAL_MS);
 
