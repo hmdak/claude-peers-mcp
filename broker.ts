@@ -117,7 +117,18 @@ function cleanStalePeers() {
   }
 }
 
-cleanStalePeers();
+// Startup grace: do NOT evict on boot.
+//
+// While the broker was down nobody could send a heartbeat, so every row looks
+// stale no matter how alive the peer is. Evicting here wipes the whole peer
+// list on every restart, and clients that only send { id } then come back as
+// "unknown" placeholders — which is exactly the bug this file is fixing.
+// Give everyone one full interval to check in instead.
+const bootNow = new Date().toISOString();
+const revived = db.run("UPDATE peers SET last_seen = ?", [bootNow]).changes;
+if (revived > 0) {
+  console.error(`[claude-peers broker] Startup grace: kept ${revived} peer(s); they have ${STALE_THRESHOLD_MS / 1000}s to check in`);
+}
 
 // Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
