@@ -26,6 +26,31 @@ import type {
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 
+// --- Shared-secret auth ---
+// If CLAUDE_PEERS_TOKEN is set, every request must present a matching
+// `Authorization: Bearer <token>` header. This guarantees that only peers
+// configured with the same user's secret can join the broker — a Claude Code
+// on the same network without the token is rejected with 401.
+// If unset, auth is disabled (backward compatible with existing deployments).
+const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
+
+// Constant-time comparison to avoid timing side-channels on the token.
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// Returns true if the request is authorized (or auth is disabled).
+function isAuthorized(req: Request): boolean {
+  if (!AUTH_TOKEN) return true; // auth disabled
+  const header = req.headers.get("authorization") ?? "";
+  const m = header.match(/^Bearer\s+(.+)$/i);
+  if (!m) return false;
+  return timingSafeEqual(m[1], AUTH_TOKEN);
+}
+
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
@@ -58,6 +83,23 @@ db.run(`
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// --- Migration: `pushed` column ---
+// The channel push loop reads via /peek-messages, which deliberately does not
+// set `delivered` (so check_messages can still show the message). Dedup lived
+// only in the server's in-memory pushedMessageIds, so an MCP reconnect replayed
+// every still-undelivered message — tens of them for a busy peer. `pushed`
+// records "already sent as a channel notification" durably, independently of
+// the delivered/ack flag.
+const msgCols = (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name);
+if (!msgCols.includes("pushed")) {
+  db.run("ALTER TABLE messages ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0");
+  // Existing rows were already pushed to their recipients under the old
+  // behaviour; marking them 1 avoids a one-off replay storm on first upgrade.
+  // They stay visible to check_messages because `delivered` is untouched.
+  const n = db.run("UPDATE messages SET pushed = 1 WHERE delivered = 0").changes;
+  console.error(`[claude-peers broker] migration: added messages.pushed, backfilled ${n} undelivered row(s)`);
+}
 
 // Stale threshold: peers not seen for 60 seconds are considered dead
 const STALE_THRESHOLD_MS = 60_000;
@@ -124,6 +166,15 @@ const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
+// Not-yet-pushed messages, for the channel push loop (see /peek-messages).
+const selectUnpushed = db.prepare(`
+  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 AND pushed = 0 ORDER BY sent_at ASC
+`);
+
+const markPushed = db.prepare(`
+  UPDATE messages SET pushed = 1 WHERE id = ?
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -137,17 +188,41 @@ function generateId(): string {
 
 // --- Request handlers ---
 
+// hostname must be in the SET list. Without it, a row created by the heartbeat
+// ghost path (hostname "unknown") could never recover its real hostname, so the
+// peer stayed "unknown" to everyone else for the rest of the session.
+const updatePeerOnReregister = db.prepare(`
+  UPDATE peers SET pid = ?, hostname = ?, cwd = ?, git_root = ?, tty = ?, last_seen = ? WHERE id = ?
+`);
+
 function handleRegister(body: RegisterRequest): RegisterResponse {
-  const id = generateId();
   const now = new Date().toISOString();
   const hostname = body.hostname ?? "localhost";
 
-  // Remove any existing registration for this PID + hostname combo (re-registration)
+  // Stable ID lets a session keep the same peer ID across `--resume` (which
+  // changes PID and Claude's own session ID). If the client provides one and
+  // it already exists, we UPDATE that row in place — so other peers' saved
+  // to_id stays valid and queued messages still reach it. Fall back to a random
+  // ID for older clients that don't send stable_id.
+  if (body.stable_id) {
+    const id = body.stable_id;
+    const existing = db.query("SELECT id FROM peers WHERE id = ?").get(id) as { id: string } | null;
+    if (existing) {
+      // Re-registration of the same logical session (e.g. after --resume):
+      // update metadata, keep the ID, and DO NOT drop undelivered messages.
+      updatePeerOnReregister.run(body.pid, hostname, body.cwd, body.git_root, body.tty, now, id);
+    } else {
+      insertPeer.run(id, body.pid, hostname, body.cwd, body.git_root, body.tty, body.summary, now, now);
+    }
+    return { id };
+  }
+
+  // Legacy path: random ID keyed by PID+hostname.
+  const id = generateId();
   const existing = db.query("SELECT id FROM peers WHERE pid = ? AND hostname = ?").get(body.pid, hostname) as { id: string } | null;
   if (existing) {
     deletePeer.run(existing.id);
   }
-
   insertPeer.run(id, body.pid, hostname, body.cwd, body.git_root, body.tty, body.summary, now, now);
   return { id };
 }
@@ -159,8 +234,18 @@ function handleHeartbeat(body: HeartbeatRequest): void {
   // so it at least appears in list_peers and can receive messages.
   // Next proper /register call (if server supports ensureRegistered) will replace this.
   if (result.changes === 0) {
-    console.error(`[claude-peers broker] Heartbeat from unknown peer ${body.id}, creating ghost entry`);
-    insertPeer.run(body.id, 0, "unknown", "", null, null, "", now, now);
+    // The peer was evicted by cleanStalePeers but is clearly still alive.
+    // Restore it from the identity carried in the heartbeat. Older clients
+    // send only { id }; for those we still have to fall back to placeholders,
+    // and their rows stay "unknown" until they re-register or restart.
+    if (body.hostname && body.cwd !== undefined) {
+      console.error(`[claude-peers broker] Restoring evicted peer ${body.id} (${body.hostname})`);
+      insertPeer.run(body.id, body.pid ?? 0, body.hostname, body.cwd,
+                     body.git_root ?? null, body.tty ?? null, body.summary ?? "", now, now);
+    } else {
+      console.error(`[claude-peers broker] Heartbeat from unknown peer ${body.id} without identity, creating ghost entry`);
+      insertPeer.run(body.id, 0, "unknown", "", null, null, "", now, now);
+    }
   }
 }
 
@@ -225,8 +310,14 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 }
 
 function handlePeekMessages(body: PollMessagesRequest): PollMessagesResponse {
-  // Return undelivered messages WITHOUT marking them as delivered
-  const messages = selectUndelivered.all(body.id) as Message[];
+  // Return undelivered messages WITHOUT marking them as delivered, so an
+  // explicit check_messages can still surface them. `pushed` is set instead:
+  // that makes channel-push dedup survive an MCP reconnect, which the server's
+  // in-memory pushedMessageIds could not.
+  const messages = selectUnpushed.all(body.id) as Message[];
+  for (const msg of messages) {
+    markPushed.run(msg.id);
+  }
   return { messages };
 }
 
@@ -251,9 +342,14 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, auth: AUTH_TOKEN ? "required" : "disabled" });
       }
       return new Response("claude-peers broker", { status: 200 });
+    }
+
+    // All POST endpoints require a valid shared-secret token (if configured).
+    if (!isAuthorized(req)) {
+      return Response.json({ error: "unauthorized: invalid or missing peers token" }, { status: 401 });
     }
 
     try {
@@ -294,4 +390,4 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (db: ${DB_PATH})`);
+console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (db: ${DB_PATH}) auth=${AUTH_TOKEN ? "REQUIRED" : "DISABLED"}`);

@@ -31,6 +31,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { createHash } from "node:crypto";
 
 // --- Configuration ---
 
@@ -44,16 +45,28 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 // Detect if broker is remote (not localhost)
 const IS_REMOTE_BROKER = !BROKER_URL.includes("127.0.0.1") && !BROKER_URL.includes("localhost");
 
+// Shared-secret token proving this peer belongs to the same user.
+// Must match the broker's CLAUDE_PEERS_TOKEN. Distributed via env (.zshenv).
+const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
+
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (AUTH_TOKEN) headers["Authorization"] = `Bearer ${AUTH_TOKEN}`;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
     const err = await res.text();
+    if (res.status === 401) {
+      throw new Error(
+        `Broker rejected this peer (401): the CLAUDE_PEERS_TOKEN on this machine does not match the broker's. ` +
+        `Ensure the same token is exported (e.g. in ~/.zshenv) on every worker and on the broker host.`,
+      );
+    }
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
   }
   return res.json() as Promise<T>;
@@ -147,12 +160,39 @@ let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 let myHostname: string = "localhost";
+let myStableId: PeerId | null = null;
+
+// Derive a stable peer ID from hostname + cwd + tty. This survives `--resume`
+// (which changes the PID and Claude's own session ID) as long as the session is
+// resumed in the same pane and directory — so the peer ID stays constant and
+// other peers' saved to_id / queued messages keep reaching it.
+// tty may be null (e.g. GUI launch); we still derive a deterministic ID, at the
+// cost that two sessions in the same cwd without a tty would collide (rare).
+function computeStableId(hostname: string, cwd: string, tty: string | null): PeerId {
+  const material = `${hostname} ${cwd} ${tty ?? ""}`;
+  // 8 lowercase-alnum chars, matching the broker's legacy ID shape.
+  const hex = createHash("sha256").update(material).digest("hex");
+  // Map hex to [a-z0-9] for visual consistency with generateId().
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "";
+  for (let i = 0; i < 8; i++) {
+    id += chars[parseInt(hex.slice(i * 2, i * 2 + 2), 16) % chars.length];
+  }
+  return id;
+}
 
 // Track message IDs that we've already pushed via channel notification
 // so we don't re-push the same message on every poll cycle
 const pushedMessageIds = new Set<number>();
 
 // Auto-register if not registered or evicted
+// True when a peer row looks like the broker's heartbeat ghost placeholder
+// rather than a real registration. Mirrors the values inserted by the broker's
+// handleHeartbeat fallback: pid 0, hostname "unknown", empty cwd.
+function isGhostRow(p: Peer): boolean {
+  return p.pid === 0 || p.hostname === "unknown" || p.cwd === "";
+}
+
 async function ensureRegistered(): Promise<boolean> {
   if (myId) {
     // Check if still registered
@@ -162,22 +202,33 @@ async function ensureRegistered(): Promise<boolean> {
         cwd: myCwd,
         git_root: myGitRoot,
       });
-      if (peers.some((p) => p.id === myId)) return true;
+      // A row created by the broker's heartbeat ghost path carries placeholder
+      // metadata (pid 0 / hostname "unknown" / empty cwd). Treating that as
+      // "registered" would skip /register forever, leaving us listed as
+      // "unknown" to every other peer. Detect it and re-register to heal.
+      const mine = peers.find((p) => p.id === myId);
+      if (mine && !isGhostRow(mine)) return true;
+      if (mine) log("Registered as a ghost entry (placeholder metadata) — re-registering to restore hostname");
     } catch {
       // Broker down — can't re-register
       return false;
     }
   }
-  // Not registered or evicted — re-register
+  // Not registered or evicted — re-register (reuse the stable ID so the peer
+  // ID stays constant across resume / stale-eviction).
   try {
     log("Auto-registering with broker...");
+    const tty = getTty();
+    const stableId = myStableId ?? computeStableId(myHostname, myCwd, tty);
+    myStableId = stableId;
     const reg = await brokerFetch<RegisterResponse>("/register", {
       pid: process.pid,
       hostname: myHostname,
       cwd: myCwd,
       git_root: myGitRoot,
-      tty: getTty(),
+      tty,
       summary: "",
+      stable_id: stableId,
     });
     myId = reg.id;
     log(`Auto-registered as peer ${myId}`);
@@ -211,7 +262,11 @@ const mcp = new Server(
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+CRITICAL — replying to the correct peer (avoid cross-talk):
+- To reply, ALWAYS use the from_id of the SPECIFIC notification you are answering right now. Each notification carries the correct from_id in its meta and its "↩ Reply to THIS peer" footer — copy that exact ID.
+- NEVER pick a from_id from earlier in the conversation, from your context/summary, or from another peer's message. If you are talking with more than one peer, they each have a different from_id, and reusing the wrong one sends your reply to the wrong session.
+- If you are unsure which peer you are replying to (e.g. after a context compaction, or when several peers are active), DO NOT guess: call check_messages (or list_peers) first to re-confirm the current from_id, then reply.
+- Peer IDs are short and easy to confuse. Match on the from_id string exactly, and use from_summary / from_cwd only to sanity-check that the ID belongs to the peer you mean.
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
@@ -376,6 +431,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+      }
+      // Guard against replying to the wrong / stale peer: verify to_id is a
+      // live peer before sending. If not, return the current roster so the
+      // caller can pick the right recipient instead of silently misfiring.
+      if (!to_id) {
+        return {
+          content: [{ type: "text" as const, text: "send_message requires to_id (the from_id of the peer you are replying to)." }],
+          isError: true,
+        };
+      }
+      try {
+        const roster = await brokerFetch<Peer[]>("/list-peers", {
+          scope: "machine",
+          cwd: myCwd,
+          git_root: myGitRoot,
+        });
+        const target = roster.find((p) => p.id === to_id);
+        if (!target) {
+          const options = roster
+            .filter((p) => p.id !== myId)
+            .map((p) => `  - ${p.id} (${p.hostname ?? "?"}${p.summary ? `: ${p.summary.slice(0, 50)}` : ""})`)
+            .join("\n");
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `Peer "${to_id}" is not currently connected (unknown or stale id). ` +
+                `Message NOT sent — this usually means you used a from_id from earlier in the conversation. ` +
+                `Reply using the from_id from the CURRENT notification. Live peers now:\n${options || "  (none)"}`,
+            }],
+            isError: true,
+          };
+        }
+      } catch {
+        // If the roster lookup fails, fall through and let the broker decide.
       }
       try {
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
@@ -568,12 +658,26 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
+      // Build a reply footer so the receiver can't confuse who to answer.
+      // It embeds the exact from_id of THIS message plus a copy-paste template.
+      const whoBits = [
+        fromHostname && `host=${fromHostname}`,
+        fromCwd && `cwd=${fromCwd}`,
+        fromSummary && `doing="${fromSummary.slice(0, 60)}"`,
+      ].filter(Boolean).join(", ");
+      const replyFooter =
+        `\n\n────────\n` +
+        `↩ Reply to THIS peer only — use this exact id:\n` +
+        `   send_message(to_id="${msg.from_id}", text="…")\n` +
+        (whoBits ? `   (${msg.from_id}: ${whoBits})\n` : "") +
+        `Do NOT reply to any other from_id from earlier in the conversation.`;
+
       // Push as channel notification — this is what makes it immediate
       try {
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
-            content: msg.text,
+            content: msg.text + replyFooter,
             meta: {
               from_id: msg.from_id,
               from_hostname: fromHostname,
@@ -638,7 +742,9 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker using a stable ID (survives --resume)
+  myStableId = computeStableId(myHostname, myCwd, tty);
+  log(`Stable ID: ${myStableId} (hostname+cwd+tty)`);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     hostname: myHostname,
@@ -646,6 +752,7 @@ async function main() {
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    stable_id: myStableId,
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
@@ -678,7 +785,23 @@ async function main() {
       return;
     }
     try {
-      await brokerFetch("/heartbeat", { id: myId });
+      // Carry our identity so that, if we were evicted while quiet, the broker
+      // restores us as ourselves instead of inventing a placeholder row.
+      await brokerFetch("/heartbeat", {
+        id: myId,
+        pid: process.pid,
+        hostname: myHostname,
+        cwd: myCwd,
+        git_root: myGitRoot,
+        tty: getTty(),
+      });
+      // A successful heartbeat is not proof that our row still holds real
+      // metadata: if we were evicted and the heartbeat recreated us as a ghost,
+      // the row now says hostname "unknown". ensureRegistered() detects that and
+      // re-registers, so the placeholder heals on its own within one interval.
+      // Tool handlers call it too, but an idle session invokes no tools — and it
+      // is exactly the idle ones that get evicted, so this loop has to cover it.
+      await ensureRegistered();
     } catch {
       // Heartbeat failed — check if evicted and re-register
       await ensureRegistered();
